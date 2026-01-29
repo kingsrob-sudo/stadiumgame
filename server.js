@@ -87,6 +87,7 @@ async function initializeSheets() {
 // Background sync queue
 let syncQueue = [];
 let isSyncing = false;
+let sheetRowMap = new Map(); // Maps user_id to sheet row number
 
 // Background job: Sync to Google Sheets every 10 seconds
 setInterval(async () => {
@@ -107,32 +108,85 @@ setInterval(async () => {
     
     console.log(`📤 Syncing ${result.rows.length} records to Google Sheets...`);
     
-    // Prepare batch data for Sheets
-    const values = result.rows.map(row => [
-      row.timestamp.toISOString(),
-      row.user_id,
-      row.email,
-      row.box_choice,
-      row.won ? 'TRUE' : 'FALSE',
-      row.prize_location || ''
-    ]);
+    // Get current sheet data to find existing rows
+    let existingRows = [];
+    try {
+      const sheetData = await sheetsClient.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Sheet1!A:F',
+      });
+      existingRows = sheetData.data.values || [];
+    } catch (error) {
+      console.log('No existing sheet data, will create new rows');
+    }
     
-    // Batch append to Sheets
-    await sheetsClient.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'Sheet1!A:F',
-      valueInputOption: 'USER_ENTERED',
-      resource: { values }
+    // Separate new records from updates
+    const newRecords = [];
+    const updateRecords = [];
+    
+    result.rows.forEach(row => {
+      // Find if this user_id already exists in the sheet
+      const existingRowIndex = existingRows.findIndex(sheetRow => sheetRow[1] === row.user_id);
+      
+      if (existingRowIndex === -1) {
+        // New record - add to append batch
+        newRecords.push(row);
+      } else {
+        // Existing record - add to update batch
+        updateRecords.push({ row, sheetRowIndex: existingRowIndex + 1 }); // +1 for 1-based indexing
+      }
     });
     
-    // Mark as synced in database
+    // Append new records
+    if (newRecords.length > 0) {
+      const values = newRecords.map(row => [
+        row.timestamp.toISOString(),
+        row.user_id,
+        row.email,
+        row.box_choice,
+        row.won ? 'TRUE' : 'FALSE',
+        row.prize_location || ''
+      ]);
+      
+      await sheetsClient.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Sheet1!A:F',
+        valueInputOption: 'USER_ENTERED',
+        resource: { values }
+      });
+      
+      console.log(`✅ Appended ${newRecords.length} new records`);
+    }
+    
+    // Update existing records
+    if (updateRecords.length > 0) {
+      const updates = updateRecords.map(({ row, sheetRowIndex }) => ({
+        range: `Sheet1!E${sheetRowIndex}:F${sheetRowIndex}`,
+        values: [[
+          row.won ? 'TRUE' : 'FALSE',
+          row.prize_location || ''
+        ]]
+      }));
+      
+      await sheetsClient.spreadsheets.values.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        resource: {
+          valueInputOption: 'USER_ENTERED',
+          data: updates
+        }
+      });
+      
+      console.log(`✅ Updated ${updateRecords.length} existing records`);
+    }
+    
+    // Mark all as synced
     const userIds = result.rows.map(row => row.user_id);
     await pool.query(
       'UPDATE participants SET synced_to_sheets = TRUE WHERE user_id = ANY($1)',
       [userIds]
     );
     
-    console.log(`✅ Synced ${result.rows.length} records to Google Sheets`);
+    console.log(`✅ Synced ${result.rows.length} total records to Google Sheets`);
     
   } catch (error) {
     console.error('❌ Error syncing to Sheets:', error.message);
@@ -216,15 +270,16 @@ io.on('connection', (socket) => {
     
     try {
       // Update all participants with correct/incorrect
+      // AND mark them as needing re-sync to update Google Sheets
       await pool.query(
-        'UPDATE participants SET won = (box_choice = $1) WHERE won = FALSE',
+        'UPDATE participants SET won = (box_choice = $1), synced_to_sheets = FALSE',
         [correctBox]
       );
       
       // Select winners (10 random from correct guesses)
       const winnersResult = await pool.query(
         `UPDATE participants 
-         SET is_winner = TRUE, prize_location = $2
+         SET is_winner = TRUE, prize_location = $2, synced_to_sheets = FALSE
          WHERE user_id IN (
            SELECT user_id FROM participants 
            WHERE box_choice = $1 AND is_winner = FALSE
