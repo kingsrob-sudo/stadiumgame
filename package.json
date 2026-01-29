@@ -1,7 +1,7 @@
 {
   "name": "stadium-game-backend",
-  "version": "1.0.0",
-  "description": "Backend server for stadium prize game with WebSocket support",
+  "version": "2.0.0",
+  "description": "Backend server for stadium prize game with PostgreSQL and Google Sheets backup",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,8 @@
     "stadium",
     "websocket",
     "game",
-    "socket.io"
+    "socket.io",
+    "postgresql"
   ],
   "author": "",
   "license": "MIT",
@@ -19,6 +20,7 @@
     "express": "^4.18.2",
     "socket.io": "^4.6.1",
     "googleapis": "^118.0.0",
+    "pg": "^8.11.3",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3"
   },

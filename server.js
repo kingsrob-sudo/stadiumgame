@@ -2,6 +2,7 @@ const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const { google } = require('googleapis');
+const { Pool } = require('pg');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -19,10 +20,52 @@ const io = new Server(httpServer, {
 app.use(cors());
 app.use(express.json());
 
+// PostgreSQL Setup
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Test database connection
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('❌ PostgreSQL connection error:', err);
+  } else {
+    console.log('✅ PostgreSQL connected');
+  }
+});
+
+// Create tables if they don't exist
+async function initializeDatabase() {
+  const createTableQuery = `
+    CREATE TABLE IF NOT EXISTS participants (
+      id SERIAL PRIMARY KEY,
+      user_id VARCHAR(255) UNIQUE NOT NULL,
+      email VARCHAR(255) NOT NULL,
+      box_choice INTEGER NOT NULL,
+      timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      won BOOLEAN DEFAULT FALSE,
+      is_winner BOOLEAN DEFAULT FALSE,
+      prize_location VARCHAR(255),
+      synced_to_sheets BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_user_id ON participants(user_id);
+    CREATE INDEX IF NOT EXISTS idx_synced ON participants(synced_to_sheets);
+  `;
+  
+  try {
+    await pool.query(createTableQuery);
+    console.log('✅ Database tables initialized');
+  } catch (error) {
+    console.error('❌ Error creating tables:', error);
+  }
+}
+
 // Google Sheets Setup
 const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-
 let sheetsClient;
 
 // Initialize Google Sheets client
@@ -35,17 +78,74 @@ async function initializeSheets() {
     
     const authClient = await auth.getClient();
     sheetsClient = google.sheets({ version: 'v4', auth: authClient });
-    console.log('✅ Google Sheets connected');
+    console.log('✅ Google Sheets connected (backup mode)');
   } catch (error) {
-    console.error('❌ Error connecting to Google Sheets:', error.message);
+    console.error('⚠️  Google Sheets not available (backup disabled):', error.message);
   }
 }
 
-// Game State
+// Background sync queue
+let syncQueue = [];
+let isSyncing = false;
+
+// Background job: Sync to Google Sheets every 10 seconds
+setInterval(async () => {
+  if (isSyncing || !sheetsClient) return;
+  
+  try {
+    isSyncing = true;
+    
+    // Get unsynced records from database
+    const result = await pool.query(
+      'SELECT * FROM participants WHERE synced_to_sheets = FALSE ORDER BY created_at ASC LIMIT 50'
+    );
+    
+    if (result.rows.length === 0) {
+      isSyncing = false;
+      return;
+    }
+    
+    console.log(`📤 Syncing ${result.rows.length} records to Google Sheets...`);
+    
+    // Prepare batch data for Sheets
+    const values = result.rows.map(row => [
+      row.timestamp.toISOString(),
+      row.user_id,
+      row.email,
+      row.box_choice,
+      row.won ? 'TRUE' : 'FALSE',
+      row.prize_location || ''
+    ]);
+    
+    // Batch append to Sheets
+    await sheetsClient.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Sheet1!A:F',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values }
+    });
+    
+    // Mark as synced in database
+    const userIds = result.rows.map(row => row.user_id);
+    await pool.query(
+      'UPDATE participants SET synced_to_sheets = TRUE WHERE user_id = ANY($1)',
+      [userIds]
+    );
+    
+    console.log(`✅ Synced ${result.rows.length} records to Google Sheets`);
+    
+  } catch (error) {
+    console.error('❌ Error syncing to Sheets:', error.message);
+  } finally {
+    isSyncing = false;
+  }
+}, 10000); // Run every 10 seconds
+
+// Game State (now just for active game, not storage)
 let gameState = {
   correctBox: null,
   revealed: false,
-  participants: new Map(), // userId -> {email, boxChoice, timestamp}
+  activeConnections: new Map(), // socketId -> email
   winners: []
 };
 
@@ -73,41 +173,31 @@ io.on('connection', (socket) => {
   socket.on('submitGuess', async (data) => {
     const { email, boxChoice } = data;
     const userId = socket.id;
-    const timestamp = new Date().toISOString();
+    const timestamp = new Date();
     
     console.log(`Guess received: ${email} chose Box ${boxChoice}`);
     
-    // Store in memory
-    gameState.participants.set(userId, {
-      email,
-      boxChoice,
-      timestamp,
-      socketId: userId
-    });
-    
-    // Write to Google Sheets
     try {
-      await appendToSheet({
-        timestamp,
-        userId,
-        email,
-        boxChoice,
-        won: '', // Will be updated after reveal
-        prizeLocation: ''
-      });
+      // Write to PostgreSQL (PRIMARY - fast!)
+      await pool.query(
+        `INSERT INTO participants (user_id, email, box_choice, timestamp)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id) DO UPDATE 
+         SET email = $2, box_choice = $3, timestamp = $4`,
+        [userId, email, boxChoice, timestamp]
+      );
+      
+      // Track active connection
+      gameState.activeConnections.set(userId, email);
       
       socket.emit('guessConfirmed', { success: true });
       
       // Send stats to controller
-      io.to('controller').emit('statsUpdate', {
-        totalParticipants: gameState.participants.size,
-        box1Count: countBoxChoices(1),
-        box2Count: countBoxChoices(2),
-        box3Count: countBoxChoices(3)
-      });
+      const stats = await getGameStats();
+      io.to('controller').emit('statsUpdate', stats);
       
     } catch (error) {
-      console.error('Error saving to sheets:', error);
+      console.error('Error saving guess:', error);
       socket.emit('guessConfirmed', { success: false, error: 'Failed to save guess' });
     }
   });
@@ -124,170 +214,200 @@ io.on('connection', (socket) => {
     gameState.correctBox = correctBox;
     gameState.revealed = true;
     
-    // Determine winners
-    const winners = selectWinners(correctBox, 10); // Select 10 winners
-    gameState.winners = winners;
-    
-    // Update Google Sheets with winners
-    await updateWinnersInSheet(winners);
-    
-    // Send reveal to videoboard
-    io.to('videoboard').emit('showWinner', { correctBox });
-    
-    // Send results to all audience members
-    gameState.participants.forEach((participant, userId) => {
-      const won = participant.boxChoice === correctBox;
-      const isWinner = winners.some(w => w.userId === userId);
+    try {
+      // Update all participants with correct/incorrect
+      await pool.query(
+        'UPDATE participants SET won = (box_choice = $1) WHERE won = FALSE',
+        [correctBox]
+      );
       
-      io.to(userId).emit('result', {
-        won,
-        correctBox,
-        yourChoice: participant.boxChoice,
-        isWinner,
-        prizeLocation: isWinner ? 'Section 101, Gate B' : null
+      // Select winners (10 random from correct guesses)
+      const winnersResult = await pool.query(
+        `UPDATE participants 
+         SET is_winner = TRUE, prize_location = $2
+         WHERE user_id IN (
+           SELECT user_id FROM participants 
+           WHERE box_choice = $1 AND is_winner = FALSE
+           ORDER BY RANDOM()
+           LIMIT 10
+         )
+         RETURNING user_id, email, timestamp`,
+        [correctBox, 'Section 101, Gate B']
+      );
+      
+      const winners = winnersResult.rows;
+      gameState.winners = winners;
+      
+      // Send reveal to videoboard
+      io.to('videoboard').emit('showWinner', { correctBox });
+      
+      // Get all participants to send results
+      const allParticipants = await pool.query(
+        'SELECT user_id, email, box_choice, won, is_winner, prize_location FROM participants'
+      );
+      
+      // Send results to all audience members
+      allParticipants.rows.forEach(participant => {
+        io.to(participant.user_id).emit('result', {
+          won: participant.won,
+          correctBox,
+          yourChoice: participant.box_choice,
+          isWinner: participant.is_winner,
+          prizeLocation: participant.is_winner ? participant.prize_location : null
+        });
       });
-    });
-    
-    // Send winner list to controller
-    io.to('controller').emit('winnersList', {
-      winners: winners.map(w => ({
-        email: w.email,
-        timestamp: w.timestamp
-      })),
-      totalCorrect: countBoxChoices(correctBox)
-    });
+      
+      // Send winner list to controller
+      const totalCorrect = await pool.query(
+        'SELECT COUNT(*) FROM participants WHERE box_choice = $1',
+        [correctBox]
+      );
+      
+      io.to('controller').emit('winnersList', {
+        winners: winners.map(w => ({
+          email: w.email,
+          timestamp: w.timestamp
+        })),
+        totalCorrect: parseInt(totalCorrect.rows[0].count)
+      });
+      
+    } catch (error) {
+      console.error('Error revealing winner:', error);
+    }
   });
 
   // Reset game (for testing)
-  socket.on('resetGame', () => {
+  socket.on('resetGame', async () => {
     if (socket.clientType !== 'controller') {
       return;
     }
     
     console.log('🔄 Game reset');
-    gameState = {
-      correctBox: null,
-      revealed: false,
-      participants: new Map(),
-      winners: []
-    };
     
-    io.emit('gameReset');
+    try {
+      // Archive old data by marking it (don't delete - keep for records)
+      // In production, you might want to move to an archive table
+      await pool.query('DELETE FROM participants'); // For testing, clear it
+      
+      gameState = {
+        correctBox: null,
+        revealed: false,
+        activeConnections: new Map(),
+        winners: []
+      };
+      
+      io.emit('gameReset');
+    } catch (error) {
+      console.error('Error resetting game:', error);
+    }
   });
 
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
-    // Don't remove from participants - they already submitted
+    gameState.activeConnections.delete(socket.id);
   });
 });
 
 // Helper Functions
-function countBoxChoices(boxNumber) {
-  let count = 0;
-  gameState.participants.forEach(p => {
-    if (p.boxChoice === boxNumber) count++;
-  });
-  return count;
-}
-
-function selectWinners(correctBox, count) {
-  // Get all participants who chose correctly
-  const correctGuesses = [];
-  gameState.participants.forEach((participant, userId) => {
-    if (participant.boxChoice === correctBox) {
-      correctGuesses.push({ ...participant, userId });
-    }
-  });
-  
-  // Randomly select winners
-  const shuffled = correctGuesses.sort(() => 0.5 - Math.random());
-  return shuffled.slice(0, Math.min(count, shuffled.length));
-}
-
-// Google Sheets Functions
-async function appendToSheet(data) {
-  if (!sheetsClient) {
-    console.log('Sheets not initialized, skipping write');
-    return;
-  }
-  
-  const values = [[
-    data.timestamp,
-    data.userId,
-    data.email,
-    data.boxChoice,
-    data.won,
-    data.prizeLocation
-  ]];
-  
+async function getGameStats() {
   try {
-    await sheetsClient.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'Sheet1!A:F',
-      valueInputOption: 'USER_ENTERED',
-      resource: { values }
-    });
+    const result = await pool.query(`
+      SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN box_choice = 1 THEN 1 END) as box1,
+        COUNT(CASE WHEN box_choice = 2 THEN 1 END) as box2,
+        COUNT(CASE WHEN box_choice = 3 THEN 1 END) as box3
+      FROM participants
+    `);
+    
+    const stats = result.rows[0];
+    return {
+      totalParticipants: parseInt(stats.total),
+      box1Count: parseInt(stats.box1),
+      box2Count: parseInt(stats.box2),
+      box3Count: parseInt(stats.box3)
+    };
   } catch (error) {
-    console.error('Error writing to sheet:', error.message);
-    throw error;
-  }
-}
-
-async function updateWinnersInSheet(winners) {
-  if (!sheetsClient || winners.length === 0) return;
-  
-  try {
-    // Get all rows to find the ones to update
-    const response = await sheetsClient.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'Sheet1!A:F',
-    });
-    
-    const rows = response.data.values || [];
-    const updates = [];
-    
-    // Find and mark winners
-    winners.forEach(winner => {
-      const rowIndex = rows.findIndex(row => row[1] === winner.userId);
-      if (rowIndex !== -1) {
-        // Row index + 1 for 1-based indexing, +1 more for header
-        updates.push({
-          range: `Sheet1!E${rowIndex + 1}:F${rowIndex + 1}`,
-          values: [['TRUE', 'Section 101, Gate B']]
-        });
-      }
-    });
-    
-    if (updates.length > 0) {
-      await sheetsClient.spreadsheets.values.batchUpdate({
-        spreadsheetId: SPREADSHEET_ID,
-        resource: {
-          valueInputOption: 'USER_ENTERED',
-          data: updates
-        }
-      });
-    }
-  } catch (error) {
-    console.error('Error updating winners:', error.message);
+    console.error('Error getting stats:', error);
+    return {
+      totalParticipants: 0,
+      box1Count: 0,
+      box2Count: 0,
+      box3Count: 0
+    };
   }
 }
 
 // Health check endpoint
-app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    participants: gameState.participants.size,
-    revealed: gameState.revealed,
-    correctBox: gameState.correctBox
-  });
+app.get('/', async (req, res) => {
+  try {
+    const stats = await getGameStats();
+    const unsyncedCount = await pool.query(
+      'SELECT COUNT(*) FROM participants WHERE synced_to_sheets = FALSE'
+    );
+    
+    res.json({
+      status: 'running',
+      database: 'postgresql',
+      participants: stats.totalParticipants,
+      revealed: gameState.revealed,
+      correctBox: gameState.correctBox,
+      unsyncedToSheets: parseInt(unsyncedCount.rows[0].count),
+      sheetsBackupEnabled: !!sheetsClient
+    });
+  } catch (error) {
+    res.json({
+      status: 'error',
+      error: error.message
+    });
+  }
+});
+
+// Admin endpoint to view all participants (for debugging)
+app.get('/admin/participants', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM participants ORDER BY timestamp DESC LIMIT 100'
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin endpoint to manually trigger sheets sync
+app.post('/admin/sync-sheets', async (req, res) => {
+  try {
+    if (!sheetsClient) {
+      return res.status(400).json({ error: 'Google Sheets not configured' });
+    }
+    
+    // Force a sync
+    const result = await pool.query(
+      'SELECT * FROM participants WHERE synced_to_sheets = FALSE ORDER BY created_at ASC'
+    );
+    
+    res.json({
+      message: 'Sync will run on next cycle',
+      pendingRecords: result.rows.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 
-initializeSheets().then(() => {
+async function startServer() {
+  await initializeDatabase();
+  await initializeSheets();
+  
   httpServer.listen(PORT, () => {
     console.log(`🏀 Stadium Game Server running on port ${PORT}`);
-    console.log(`📊 Participants: ${gameState.participants.size}`);
+    console.log(`📊 Database: PostgreSQL`);
+    console.log(`📤 Google Sheets backup: ${sheetsClient ? 'ENABLED' : 'DISABLED'}`);
   });
-});
+}
+
+startServer();
