@@ -53,6 +53,7 @@ async function initializeDatabase() {
     
     CREATE INDEX IF NOT EXISTS idx_user_id ON participants(user_id);
     CREATE INDEX IF NOT EXISTS idx_synced ON participants(synced_to_sheets);
+    CREATE INDEX IF NOT EXISTS idx_email_lower ON participants(LOWER(email));
   `;
   
   try {
@@ -232,6 +233,22 @@ io.on('connection', (socket) => {
     console.log(`Guess received: ${email} chose Box ${boxChoice}`);
     
     try {
+      // Check if this email has already been used
+      const existingEmail = await pool.query(
+        'SELECT user_id, email FROM participants WHERE LOWER(email) = LOWER($1) LIMIT 1',
+        [email]
+      );
+      
+      if (existingEmail.rows.length > 0 && existingEmail.rows[0].user_id !== userId) {
+        // This email is already used by a different user
+        console.log(`Email already used: ${email}`);
+        socket.emit('guessConfirmed', { 
+          success: false, 
+          error: 'This email address has already been used. Please use a different email.' 
+        });
+        return;
+      }
+      
       // Write to PostgreSQL (PRIMARY - fast!)
       await pool.query(
         `INSERT INTO participants (user_id, email, box_choice, timestamp)
