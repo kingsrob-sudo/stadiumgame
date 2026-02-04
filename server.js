@@ -348,6 +348,18 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Controller launches the game (starts intro video)
+  socket.on('launchGame', () => {
+    if (socket.clientType !== 'controller') {
+      return; // Only controller can launch
+    }
+    
+    console.log('🚀 LAUNCH: Game started from controller');
+    
+    // Send launch signal to videoboard
+    io.to('videoboard').emit('launchGame');
+  });
+
   // Reset game (for testing)
   socket.on('resetGame', async () => {
     if (socket.clientType !== 'controller') {
