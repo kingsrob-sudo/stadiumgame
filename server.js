@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const { google } = require('googleapis');
 const { Pool } = require('pg');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
 require('dotenv').config();
 
 const app = express();
@@ -19,6 +20,41 @@ const io = new Server(httpServer, {
 
 app.use(cors());
 app.use(express.json());
+
+// Hardcoded prize codes for top 10 winners (always the same)
+const PRIZE_CODES = [
+  'FE32', 'BK47', 'MN89', 'QR56', 'WX12',
+  'LZ34', 'DP78', 'GT91', 'HS23', 'VY65'
+];
+
+// Controller credentials (hashed password)
+const CONTROLLER_USERNAME = 'GLC2026';
+// Password: prize26box! (hashed with bcrypt)
+const CONTROLLER_PASSWORD_HASH = '$2a$10$8kZQ7XJvYN.YxKZQqP5HxORjJM5Sv0PxP/C5VzHvN9qKNxB9.Q8uK';
+
+// Authentication endpoint for controller
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  if (!username || !password) {
+    return res.status(400).json({ success: false, error: 'Username and password required' });
+  }
+  
+  if (username !== CONTROLLER_USERNAME) {
+    return res.status(401).json({ success: false, error: 'Invalid credentials' });
+  }
+  
+  const passwordMatch = await bcrypt.compare(password, CONTROLLER_PASSWORD_HASH);
+  
+  if (!passwordMatch) {
+    return res.status(401).json({ success: false, error: 'Invalid credentials' });
+  }
+  
+  // Generate a simple session token (in production, use JWT or proper sessions)
+  const token = Buffer.from(`${username}:${Date.now()}`).toString('base64');
+  
+  res.json({ success: true, token });
+});
 
 // PostgreSQL Setup
 const pool = new Pool({
@@ -42,11 +78,13 @@ async function initializeDatabase() {
       id SERIAL PRIMARY KEY,
       user_id VARCHAR(255) UNIQUE NOT NULL,
       email VARCHAR(255) NOT NULL,
+      phone VARCHAR(20),
       box_choice INTEGER NOT NULL,
       timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       won BOOLEAN DEFAULT FALSE,
       is_winner BOOLEAN DEFAULT FALSE,
       prize_location VARCHAR(255),
+      prize_code VARCHAR(10),
       synced_to_sheets BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -114,7 +152,7 @@ setInterval(async () => {
     try {
       const sheetData = await sheetsClient.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Sheet1!A:F',
+        range: 'Sheet1!A:H',
       });
       existingRows = sheetData.data.values || [];
     } catch (error) {
@@ -144,14 +182,16 @@ setInterval(async () => {
         row.timestamp.toISOString(),
         row.user_id,
         row.email,
+        row.phone || '',
         row.box_choice,
         row.won ? 'TRUE' : 'FALSE',
-        row.prize_location || ''
+        row.prize_location || '',
+        row.prize_code || ''
       ]);
       
       await sheetsClient.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Sheet1!A:F',
+        range: 'Sheet1!A:H',
         valueInputOption: 'USER_ENTERED',
         resource: { values }
       });
@@ -162,10 +202,11 @@ setInterval(async () => {
     // Update existing records
     if (updateRecords.length > 0) {
       const updates = updateRecords.map(({ row, sheetRowIndex }) => ({
-        range: `Sheet1!E${sheetRowIndex}:F${sheetRowIndex}`,
+        range: `Sheet1!F${sheetRowIndex}:H${sheetRowIndex}`,
         values: [[
           row.won ? 'TRUE' : 'FALSE',
-          row.prize_location || ''
+          row.prize_location || '',
+          row.prize_code || ''
         ]]
       }));
       
@@ -226,11 +267,11 @@ io.on('connection', (socket) => {
 
   // Audience member submits their guess
   socket.on('submitGuess', async (data) => {
-    const { email, boxChoice } = data;
+    const { email, phone, boxChoice } = data;
     const userId = socket.id;
     const timestamp = new Date();
     
-    console.log(`Guess received: ${email} chose Box ${boxChoice}`);
+    console.log(`Guess received: ${email} (${phone}) chose Box ${boxChoice}`);
     
     try {
       // Check if this email has already been used
@@ -251,11 +292,11 @@ io.on('connection', (socket) => {
       
       // Write to PostgreSQL (PRIMARY - fast!)
       await pool.query(
-        `INSERT INTO participants (user_id, email, box_choice, timestamp)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO participants (user_id, email, phone, box_choice, timestamp)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (user_id) DO UPDATE 
-         SET email = $2, box_choice = $3, timestamp = $4`,
-        [userId, email, boxChoice, timestamp]
+         SET email = $2, phone = $3, box_choice = $4, timestamp = $5`,
+        [userId, email, phone, boxChoice, timestamp]
       );
       
       // Track active connection
@@ -293,21 +334,31 @@ io.on('connection', (socket) => {
         [correctBox]
       );
       
-      // Select winners (10 random from correct guesses)
-      const winnersResult = await pool.query(
-        `UPDATE participants 
-         SET is_winner = TRUE, prize_location = $2, synced_to_sheets = FALSE
-         WHERE user_id IN (
-           SELECT user_id FROM participants 
-           WHERE box_choice = $1 AND is_winner = FALSE
-           ORDER BY RANDOM()
-           LIMIT 10
-         )
-         RETURNING user_id, email, timestamp`,
-        [correctBox, 'Section 101, Gate B']
+      // Select winners (10 random from correct guesses) and assign prize codes
+      const winnerIdsResult = await pool.query(
+        `SELECT user_id FROM participants 
+         WHERE box_choice = $1 AND is_winner = FALSE
+         ORDER BY RANDOM()
+         LIMIT 10`,
+        [correctBox]
       );
       
-      const winners = winnersResult.rows;
+      // Assign prize codes to each winner
+      const updatePromises = winnerIdsResult.rows.map((row, index) => {
+        return pool.query(
+          `UPDATE participants 
+           SET is_winner = TRUE, 
+               prize_location = $1, 
+               prize_code = $2,
+               synced_to_sheets = FALSE
+           WHERE user_id = $3
+           RETURNING user_id, email, phone, timestamp, prize_code`,
+          ['Section 101, Gate B', PRIZE_CODES[index], row.user_id]
+        );
+      });
+      
+      const winnersResults = await Promise.all(updatePromises);
+      const winners = winnersResults.map(result => result.rows[0]);
       gameState.winners = winners;
       
       // Send reveal to videoboard
@@ -315,7 +366,7 @@ io.on('connection', (socket) => {
       
       // Get all participants to send results
       const allParticipants = await pool.query(
-        'SELECT user_id, email, box_choice, won, is_winner, prize_location FROM participants'
+        'SELECT user_id, email, phone, box_choice, won, is_winner, prize_location, prize_code FROM participants'
       );
       
       // Send results to all audience members
@@ -325,7 +376,8 @@ io.on('connection', (socket) => {
           correctBox,
           yourChoice: participant.box_choice,
           isWinner: participant.is_winner,
-          prizeLocation: participant.is_winner ? participant.prize_location : null
+          prizeLocation: participant.is_winner ? participant.prize_location : null,
+          prizeCode: participant.is_winner ? participant.prize_code : null
         });
       });
       
@@ -338,6 +390,8 @@ io.on('connection', (socket) => {
       io.to('controller').emit('winnersList', {
         winners: winners.map(w => ({
           email: w.email,
+          phone: w.phone,
+          prizeCode: w.prize_code,
           timestamp: w.timestamp
         })),
         totalCorrect: parseInt(totalCorrect.rows[0].count)
