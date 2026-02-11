@@ -4,7 +4,6 @@ const { Server } = require('socket.io');
 const { google } = require('googleapis');
 const { Pool } = require('pg');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
 require('dotenv').config();
 
 const app = express();
@@ -27,32 +26,28 @@ const PRIZE_CODES = [
   'LZ34', 'DP78', 'GT91', 'HS23', 'VY65'
 ];
 
-// Controller credentials (hashed password)
+// Controller credentials
 const CONTROLLER_USERNAME = 'GLC2026';
-// Password: prize26box! (hashed with bcrypt)
-const CONTROLLER_PASSWORD_HASH = '$2a$10$8kZQ7XJvYN.YxKZQqP5HxORjJM5Sv0PxP/C5VzHvN9qKNxB9.Q8uK';
+const CONTROLLER_PASSWORD = 'prize26box!';
 
 // Authentication endpoint for controller
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
   
+  console.log('Login attempt:', username); // Debug log
+  
   if (!username || !password) {
     return res.status(400).json({ success: false, error: 'Username and password required' });
   }
   
-  if (username !== CONTROLLER_USERNAME) {
+  if (username !== CONTROLLER_USERNAME || password !== CONTROLLER_PASSWORD) {
     return res.status(401).json({ success: false, error: 'Invalid credentials' });
   }
   
-  const passwordMatch = await bcrypt.compare(password, CONTROLLER_PASSWORD_HASH);
-  
-  if (!passwordMatch) {
-    return res.status(401).json({ success: false, error: 'Invalid credentials' });
-  }
-  
-  // Generate a simple session token (in production, use JWT or proper sessions)
+  // Generate a simple session token
   const token = Buffer.from(`${username}:${Date.now()}`).toString('base64');
   
+  console.log('Login successful:', username); // Debug log
   res.json({ success: true, token });
 });
 
