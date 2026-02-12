@@ -92,6 +92,15 @@ async function initializeDatabase() {
   try {
     await pool.query(createTableQuery);
     console.log('✅ Database tables initialized');
+    
+    // Add missing columns if they don't exist (migration)
+    try {
+      await pool.query('ALTER TABLE participants ADD COLUMN IF NOT EXISTS phone VARCHAR(20)');
+      await pool.query('ALTER TABLE participants ADD COLUMN IF NOT EXISTS prize_code VARCHAR(10)');
+      console.log('✅ Database columns migrated');
+    } catch (migrationError) {
+      console.log('⚠️ Column migration skipped (may already exist)');
+    }
   } catch (error) {
     console.error('❌ Error creating tables:', error);
   }
@@ -364,17 +373,22 @@ io.on('connection', (socket) => {
         'SELECT user_id, email, phone, box_choice, won, is_winner, prize_location, prize_code FROM participants'
       );
       
-      // Send results to all audience members
+      // Broadcast results to ALL audience members
+      // Each client will filter based on their email
+      const resultsMap = {};
       allParticipants.rows.forEach(participant => {
-        io.to(participant.user_id).emit('result', {
+        resultsMap[participant.email.toLowerCase()] = {
           won: participant.won,
           correctBox,
           yourChoice: participant.box_choice,
           isWinner: participant.is_winner,
           prizeLocation: participant.is_winner ? participant.prize_location : null,
           prizeCode: participant.is_winner ? participant.prize_code : null
-        });
+        };
       });
+      
+      // Send to all audience (they'll filter by their email)
+      io.emit('results', { resultsMap, correctBox });
       
       // Send winner list to controller
       const totalCorrect = await pool.query(
