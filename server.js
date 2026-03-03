@@ -357,7 +357,7 @@ io.on('connection', (socket) => {
                synced_to_sheets = FALSE
            WHERE user_id = $3
            RETURNING user_id, email, phone, timestamp, prize_code`,
-          ['State Farm Drive', PRIZE_CODES[index], row.user_id]
+          ['the Hawk Walk at Gate 6', PRIZE_CODES[index], row.user_id]
         );
       });
       
